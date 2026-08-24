@@ -241,3 +241,13 @@ Le P&L horaire compare ce règlement à une situation théorique où le réalis�
 $$PnL_h=E_hP_h^{spot}-C_h^{settlement}$$
 
 Un P&L négatif correspond donc à un surcoût d'écart. Ce modèle ne reproduit pas toutes les règles d'un mécanisme d'ajustement réel : il sert à rendre visibles l'effet de la qualité de prévision et l'asymétrie des prix d'écart.
+
+## 14. Registre des transactions
+
+Le registre « Transactions » constitue un journal opérationnel simplifié des achats d'énergie, de capacité, de garanties d'origine, de VNU et de PPA. Chaque ligne possède sa propre unité de volume et de prix : les volumes de produits différents ne doivent donc pas être additionnés comme s'ils étaient homogènes.
+
+Les profils **Base** et **Peak** décrivent les plages de livraison d'un produit énergie. Les mentions **Capacité**, **GO** et **VNU** identifient les autres natures contractuelles. Un PPA est présenté comme une livraison d'énergie à plus long terme ; son profil peut être Base dans cette démonstration simplifiée.
+
+Le contrôle documentaire vérifie les champs obligatoires, la cohérence des dates, les volumes positifs, l'accusé de réception signé avec le trader et la déclaration au responsable d'équilibre. Cette dernière est requise pour Énergie, PPA et VNU, mais marquée « Non applicable » pour la capacité et les garanties d'origine.
+
+Le collatéral est renseigné en euros par transaction et simplement totalisé sur les lignes actives. Le registre ne simule ni appels de marge, ni mark-to-market, ni netting par contrepartie. Les données sont conservées dans la session Streamlit et exportables en CSV ; une base de données et un journal d'audit seraient nécessaires pour un usage opérationnel.

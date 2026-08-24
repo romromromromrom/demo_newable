@@ -17,6 +17,7 @@ from energy_calculations import (aggregate_load, calculate_cost, monthly_blocks,
 from forecast_calculations import (PROVIDERS, barycentric_forecast,
     calculate_balancing_pnl, generate_imbalance_prices,
     generate_provider_forecasts, inverse_mape_weights, mae_table)
+from transaction_data import default_transactions, validate_transactions
 
 st.set_page_config(page_title="EnergyPilot", page_icon="⚡", layout="wide")
 
@@ -249,7 +250,7 @@ st.plotly_chart(overview_fig, width="stretch", key="portfolio_consumption_overvi
 st.caption("Répartition mensuelle par usage. Le graphique horaire/journalier, le prix spot et le bloc sont disponibles dans l’onglet « Vue portefeuille » ci-dessous.")
 
 tabs = st.tabs(["Vue portefeuille", "Couverture & optimisation", "Factures",
-                "Détail des bâtiments", "Prévisions court terme",
+                "Détail des bâtiments", "Transactions", "Prévisions court terme",
                 "Hypothèses & données"])
 
 with tabs[0]:
@@ -338,6 +339,105 @@ with tabs[3]:
     st.plotly_chart(fig_detail, width="stretch")
 
 with tabs[4]:
+    st.subheader("Registre des transactions")
+    st.caption("Une ligne par achat d'énergie, capacité, garantie d'origine, VNU ou PPA. Les données présentées sont fictives et éditables.")
+
+    if "transactions" not in st.session_state:
+        st.session_state.transactions = default_transactions()
+    trx = st.session_state.transactions
+    anomalies = validate_transactions(trx)
+    active = trx[trx["Statut"].isin(["Actif", "À régulariser"])]
+    energy_products = active[active["Produit"].isin(["Énergie", "PPA", "VNU"])]
+
+    trx_kpis = st.columns(6)
+    trx_kpis[0].metric("Transactions", f"{len(trx)}")
+    trx_kpis[1].metric("Produits actifs", f"{len(active)}")
+    trx_kpis[2].metric("Collatéral mobilisé", money(float(active["Collatéral (€)"].fillna(0).sum())))
+    trx_kpis[3].metric("Énergie / PPA / VNU", f"{len(energy_products)} lignes")
+    trx_kpis[4].metric("Accusés non signés", f"{int((~trx['Accusé signé'].fillna(False)).sum())}", "à régulariser")
+    trx_kpis[5].metric("Alertes conformité", f"{len(anomalies)}", "orange + rouge")
+
+    status_cols = st.columns(3)
+    signed_rate = float(trx["Accusé signé"].fillna(False).mean()) if len(trx) else 0
+    re_scope = trx[trx["Produit"].isin(["Énergie", "PPA", "VNU"])]
+    re_rate = float(re_scope["Déclaration RE"].eq("Déclarée").mean()) if len(re_scope) else 1
+    if signed_rate == 1:
+        status_cols[0].success(f"Accusés trader signés : {signed_rate:.0%}")
+    else:
+        status_cols[0].warning(f"Accusés trader signés : {signed_rate:.0%}")
+    if re_rate == 1:
+        status_cols[1].success(f"Déclarations RE : {re_rate:.0%}")
+    else:
+        status_cols[1].warning(f"Déclarations RE : {re_rate:.0%}")
+    if len(anomalies) and (anomalies.Niveau == "Rouge").any():
+        status_cols[2].error(f"{(anomalies.Niveau == 'Rouge').sum()} contrôle(s) rouge(s)")
+    else:
+        status_cols[2].success("Aucun contrôle rouge")
+
+    st.markdown("### Saisie et mise à jour")
+    st.info("Ajoutez une ligne avec le bouton situé sous le tableau. Pour les produits physiques Énergie, PPA et VNU, la déclaration au responsable d'équilibre est contrôlée. Pour Capacité et GO, sélectionnez « Non applicable ».")
+    edited_transactions = st.data_editor(
+        trx,
+        hide_index=True,
+        width="stretch",
+        num_rows="dynamic",
+        key="transaction_editor",
+        column_config={
+            "Référence": st.column_config.TextColumn(required=True, width="medium"),
+            "Date transaction": st.column_config.DateColumn(format="DD/MM/YYYY", required=True),
+            "Produit": st.column_config.SelectboxColumn(options=["Énergie", "Capacité", "Garantie d'origine", "VNU", "PPA"], required=True),
+            "Profil": st.column_config.SelectboxColumn(options=["Base", "Peak", "Capacité", "GO", "VNU"], required=True),
+            "Début livraison": st.column_config.DateColumn(format="DD/MM/YYYY", required=True),
+            "Fin livraison": st.column_config.DateColumn(format="DD/MM/YYYY", required=True),
+            "Volume": st.column_config.NumberColumn(min_value=0.0, format="%.2f", required=True),
+            "Unité volume": st.column_config.SelectboxColumn(options=["MW", "MWh", "certificats", "garanties"], required=True),
+            "Prix": st.column_config.NumberColumn(format="%.2f", required=True),
+            "Unité prix": st.column_config.SelectboxColumn(options=["€/MWh", "k€/MW", "€/certificat", "€/garantie"], required=True),
+            "Collatéral (€)": st.column_config.NumberColumn(min_value=0.0, format="%.0f €"),
+            "Accusé signé": st.column_config.CheckboxColumn(help="Confirmation signée avec le trader"),
+            "Déclaration RE": st.column_config.SelectboxColumn(options=["Déclarée", "En attente", "Rejetée", "Non applicable"]),
+            "Date déclaration RE": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Statut": st.column_config.SelectboxColumn(options=["Brouillon", "À confirmer", "Actif", "Livré", "Annulé", "À régulariser"]),
+        },
+    )
+    action_cols = st.columns([1, 1, 4])
+    if action_cols[0].button("Enregistrer le registre", type="primary", width="stretch"):
+        st.session_state.transactions = edited_transactions.copy()
+        st.success("Registre enregistré dans la session.")
+        st.rerun()
+    if action_cols[1].button("Réinitialiser les transactions", width="stretch"):
+        st.session_state.transactions = default_transactions()
+        st.session_state.pop("transaction_editor", None)
+        st.rerun()
+
+    edited_anomalies = validate_transactions(edited_transactions)
+    if len(edited_anomalies):
+        with st.expander(f"⚠️ Contrôles à traiter ({len(edited_anomalies)})", expanded=True):
+            alert_view = edited_anomalies.copy()
+            alert_view["Voyant"] = alert_view.Niveau.map({"Rouge": "🔴", "Orange": "🟠"})
+            st.dataframe(alert_view[["Voyant", "Référence", "Contrôle"]], hide_index=True, width="stretch")
+    else:
+        st.success("Toutes les transactions passent les contrôles documentaires.")
+
+    st.markdown("### Recherche et exposition")
+    filter_cols = st.columns(3)
+    trx_products = filter_cols[0].multiselect("Produit", sorted(edited_transactions["Produit"].dropna().unique()), default=sorted(edited_transactions["Produit"].dropna().unique()), key="trx_products")
+    trx_profiles = filter_cols[1].multiselect("Profil", sorted(edited_transactions["Profil"].dropna().unique()), default=sorted(edited_transactions["Profil"].dropna().unique()), key="trx_profiles")
+    trx_statuses = filter_cols[2].multiselect("Statut", sorted(edited_transactions["Statut"].dropna().unique()), default=sorted(edited_transactions["Statut"].dropna().unique()), key="trx_statuses")
+    trx_filtered = edited_transactions[edited_transactions["Produit"].isin(trx_products) & edited_transactions["Profil"].isin(trx_profiles) & edited_transactions["Statut"].isin(trx_statuses)]
+    exposure = trx_filtered.groupby("Produit", as_index=False).agg(Volume=("Volume", "sum"), Collatéral=("Collatéral (€)", "sum"))
+    trx_chart = make_subplots(specs=[[{"secondary_y": True}]])
+    trx_chart.add_bar(x=exposure.Produit, y=exposure.Volume, name="Volume contractuel", marker_color="#2563EB", secondary_y=False)
+    trx_chart.add_scatter(x=exposure.Produit, y=exposure.Collatéral, name="Collatéral", mode="lines+markers", line=dict(color="#F59E0B", width=3), secondary_y=True)
+    trx_chart.update_yaxes(title_text="Volume (unités contractuelles)", secondary_y=False)
+    trx_chart.update_yaxes(title_text="Collatéral (€)", secondary_y=True, showgrid=False)
+    trx_chart.update_layout(height=370, legend=dict(orientation="h", y=1.1), margin=dict(l=20,r=20,t=35,b=20))
+    st.plotly_chart(trx_chart, width="stretch", key="transaction_exposure")
+    st.caption("Les volumes de produits différents ne sont pas additionnables physiquement ; le graphique conserve l'unité contractuelle de chaque ligne.")
+    st.download_button("Télécharger le registre CSV", edited_transactions.to_csv(index=False).encode(),
+                       "registre_transactions.csv", "text/csv")
+
+with tabs[5]:
     st.subheader("Plateforme de prévisions court terme")
     st.caption("Simulation day-ahead des échanges avec des prévisionnistes externes et valorisation des écarts au pas horaire.")
 
@@ -468,7 +568,7 @@ with tabs[4]:
     st.download_button("Télécharger le suivi horaire CSV", export_balancing.to_csv().encode(),
                        "previsions_et_balancing.csv", "text/csv")
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Hypothèses, qualité et données")
     note_path = Path(__file__).with_name("CALCULS_ET_HYPOTHESES.md")
     note_text = note_path.read_text(encoding="utf-8")
