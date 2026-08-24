@@ -9,9 +9,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from data_generation import BUILDINGS, USAGES, generate_portfolio, generate_spot_prices, validate_import
+from data_generation import (BUILDINGS, USAGES, WEEKDAY_HOURLY_SHAPE,
+                             WEEKEND_HOURLY_SHAPE, generate_portfolio,
+                             generate_spot_prices, validate_import)
 from energy_calculations import (aggregate_load, calculate_cost, monthly_blocks,
                                  monthly_invoices, optimize_flexibility)
+from forecast_calculations import (PROVIDERS, barycentric_forecast,
+    calculate_balancing_pnl, generate_imbalance_prices,
+    generate_provider_forecasts, inverse_mape_weights, mae_table)
 
 st.set_page_config(page_title="EnergyPilot", page_icon="⚡", layout="wide")
 
@@ -42,8 +47,11 @@ def cached_portfolio(year: int, seed: int, cold: float) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def cached_spot(index_tuple: tuple, peak: float, offpeak: float, vol: float, seed: int, extreme: float):
-    return generate_spot_prices(pd.DatetimeIndex(index_tuple), peak, offpeak, vol, seed, extreme)
+def cached_spot(index_tuple: tuple, peak: float, offpeak: float, vol: float,
+                seed: int, extreme: float, weekday_shape: tuple,
+                weekend_shape: tuple):
+    return generate_spot_prices(pd.DatetimeIndex(index_tuple), peak, offpeak, vol,
+                                seed, extreme, weekday_shape, weekend_shape)
 
 
 def init_state() -> None:
@@ -71,6 +79,14 @@ def delta(current: float, ref: float, euro: bool = False) -> str:
     return f"{money(d) if euro else f'{d:,.2f}'} ({pct:+.1f} %)"
 
 
+def render_markdown_with_math(text_value: str) -> None:
+    """Rend séparément les blocs mathématiques pour un affichage KaTeX fiable."""
+    for position, part in enumerate(text_value.split("$$")):
+        if not part.strip():
+            continue
+        st.latex(part.strip()) if position % 2 else st.markdown(part)
+
+
 init_state()
 st.sidebar.markdown("## ⚡ EnergyPilot")
 st.sidebar.caption("Simulation bloc + spot · portefeuille tertiaire")
@@ -87,6 +103,32 @@ vol = st.sidebar.slider("Volatilité (€/MWh)", 0.0, 100.0, key="vol")
 spot_seed = st.sidebar.number_input("Seed spot", 0, 9999, key="spot_seed")
 extreme = st.sidebar.slider("Intensité des extrêmes", 0.0, 3.0, key="extreme")
 st.sidebar.info("Peak : du lundi au vendredi, de 08 h à 20 h. Les jours fériés ne sont pas exclus dans cette démo.")
+
+with st.sidebar.expander("Shape horaire — 24 h", expanded=False):
+    st.caption("Ajustement ajouté en €/MWh à chaque heure. Modifiez directement les 48 cellules.")
+    default_shape = pd.DataFrame({
+        "Heure": range(24),
+        "Semaine (€/MWh)": WEEKDAY_HOURLY_SHAPE,
+        "Week-end (€/MWh)": WEEKEND_HOURLY_SHAPE,
+    })
+    shape_table = st.data_editor(
+        default_shape,
+        hide_index=True,
+        width="stretch",
+        disabled=["Heure"],
+        num_rows="fixed",
+        column_config={
+            "Heure": st.column_config.NumberColumn("Heure", format="%02d h"),
+            "Semaine (€/MWh)": st.column_config.NumberColumn("Semaine", min_value=-100.0, max_value=100.0, step=1.0, format="%.0f"),
+            "Week-end (€/MWh)": st.column_config.NumberColumn("Week-end", min_value=-100.0, max_value=100.0, step=1.0, format="%.0f"),
+        },
+        key="hourly_spot_shape",
+    )
+    if st.button("Réinitialiser la shape", width="stretch"):
+        st.session_state.pop("hourly_spot_shape", None)
+        st.rerun()
+weekday_shape = tuple(shape_table["Semaine (€/MWh)"].astype(float))
+weekend_shape = tuple(shape_table["Week-end (€/MWh)"].astype(float))
 
 st.sidebar.markdown("### Portefeuille")
 cold = st.sidebar.slider("Sévérité de l'hiver", .8, 1.4, key="cold")
@@ -111,7 +153,8 @@ if not selection:
 selected = data[data.building.isin(selection)].copy()
 base_load = aggregate_load(selected)
 index = base_load.index
-spot = cached_spot(tuple(index), peak, offpeak, vol, int(spot_seed), extreme)
+spot = cached_spot(tuple(index), peak, offpeak, vol, int(spot_seed), extreme,
+                   weekday_shape, weekend_shape)
 
 st.sidebar.markdown("### Flexibilité")
 flex_enabled = st.sidebar.toggle("Activer le pilotage", value=True)
@@ -205,14 +248,16 @@ overview_fig.update_layout(
 st.plotly_chart(overview_fig, width="stretch", key="portfolio_consumption_overview")
 st.caption("Répartition mensuelle par usage. Le graphique horaire/journalier, le prix spot et le bloc sont disponibles dans l’onglet « Vue portefeuille » ci-dessous.")
 
-tabs = st.tabs(["Vue portefeuille", "Couverture & optimisation", "Factures", "Détail des bâtiments", "Hypothèses & données"])
+tabs = st.tabs(["Vue portefeuille", "Couverture & optimisation", "Factures",
+                "Détail des bâtiments", "Prévisions court terme",
+                "Hypothèses & données"])
 
 with tabs[0]:
     st.subheader("Profil de consommation et marchés")
     controls = st.columns([1, 1, 2])
     granularity = controls[0].selectbox("Pas d'affichage", ["Journalier", "Horaire", "Mensuel"])
     min_date, max_date = index.min().date(), index.max().date()
-    default_end = min(max_date, min_date + pd.Timedelta(days=30)) if granularity == "Horaire" else max_date
+    default_end = min(max_date, min_date + timedelta(days=30)) if granularity == "Horaire" else max_date
     dates = controls[1].date_input("Période", (min_date, default_end), min_value=min_date, max_value=max_date)
     profile = controls[2].radio("Profil", ["Optimisé", "Initial"], horizontal=True)
     chart_load = opt_load if profile == "Optimisé" else base_load
@@ -293,17 +338,161 @@ with tabs[3]:
     st.plotly_chart(fig_detail, width="stretch")
 
 with tabs[4]:
+    st.subheader("Plateforme de prévisions court terme")
+    st.caption("Simulation day-ahead des échanges avec des prévisionnistes externes et valorisation des écarts au pas horaire.")
+
+    forecast_controls = st.columns(4)
+    forecast_days = forecast_controls[0].selectbox("Fenêtre de suivi", [7, 14, 30], index=1, format_func=lambda x: f"{x} jours")
+    imbalance_spread = forecast_controls[1].slider("Spread moyen des écarts", 5.0, 60.0, 22.0, 1.0, help="Écart moyen en €/MWh autour du spot.")
+    imbalance_jumps = forecast_controls[2].slider("Intensité des sauts", 0.0, 3.0, 1.0, .1)
+    imbalance_seed = forecast_controls[3].number_input("Seed balancing", 0, 9999, 818)
+
+    forecast_index = index[-forecast_days * 24:]
+    actual_forecast = opt_load.sum(axis=1).loc[forecast_index] / 1000
+    provider_forecasts = generate_provider_forecasts(actual_forecast)
+    provider_metrics = mae_table(actual_forecast, provider_forecasts)
+    best_weights = inverse_mape_weights(actual_forecast, provider_forecasts)
+    available_providers = provider_metrics.loc[provider_metrics.Disponible, "Prestataire"].tolist()
+
+    st.markdown("### Supervision de la chaîne")
+    status_cols = st.columns(4)
+    stage_cards = [
+        ("Génération du réalisé", "OK", "#10B981", "Courbe portefeuille disponible"),
+        ("Calcul des features", "OK", "#10B981", "Calendrier, météo et historique prêts"),
+        ("Réception prestataires", "ALERTE", "#F59E0B", "3 reçues sur 4 attendues"),
+        ("LoadSense", "KO · EN RETARD", "#EF4444", "Échéance dépassée de 42 min"),
+    ]
+    for col, (title, state, color, detail) in zip(status_cols, stage_cards):
+        col.markdown(f"""<div style="background:white;border:1px solid #DFE7EF;border-left:6px solid {color};border-radius:10px;padding:13px;height:112px">
+        <div style="font-size:.82rem;color:#627D98">{title}</div><div style="font-weight:700;color:{color};margin:5px 0">● {state}</div><div style="font-size:.78rem;color:#486581">{detail}</div></div>""", unsafe_allow_html=True)
+
+    provider_view = provider_metrics.copy()
+    provider_view["Voyant"] = provider_view["Statut"].map({"Reçue": "🟢", "Dégradée": "🟠", "En retard": "🔴"})
+    provider_view["Dernière réception"] = ["06:08", "06:11", "06:19", "Attendue 06:15"]
+    provider_view["SLA"] = ["OK", "OK", "Qualité dégradée", "KO · +42 min"]
+    st.dataframe(provider_view[["Voyant", "Prestataire", "Statut", "Dernière réception", "SLA", "MAPE (%)"]],
+                 hide_index=True, width="stretch",
+                 column_config={"MAPE (%)": st.column_config.NumberColumn(format="%.2f %%")})
+
+    st.markdown("### Pondération barycentrique")
+    preset = st.radio("Point de pondération proposé", ["Meilleure précision", "Équipondéré", "Prudent"], horizontal=True,
+                      help="Les poids sont normalisés pour former une combinaison convexe : leur somme vaut 100 %.")
+    if preset == "Meilleure précision":
+        proposed = best_weights
+    elif preset == "Équipondéré":
+        proposed = {p: 1 / len(available_providers) for p in available_providers}
+    else:
+        ranking = provider_metrics.dropna(subset=["MAPE (%)"]).sort_values("MAPE (%)").Prestataire.tolist()
+        proposed = dict(zip(ranking, [.60, .25, .15]))
+    weight_cols = st.columns(len(available_providers))
+    raw_weights = {}
+    for col, provider in zip(weight_cols, available_providers):
+        raw_weights[provider] = col.slider(provider, 0, 100, int(round(proposed.get(provider, 0) * 100)), 1,
+                                            key=f"forecast_weight_{preset}_{provider}", format="%d %%")
+    barycentre, normalized_weights = barycentric_forecast(provider_forecasts, raw_weights)
+    bary_mape = float(((barycentre - actual_forecast).abs() / actual_forecast.replace(0, np.nan)).mean() * 100)
+
+    # Simplexe barycentrique : trois prestataires disponibles = trois sommets.
+    simplex = go.Figure()
+    points = {
+        "Choix actuel": normalized_weights,
+        "Équipondéré": {p: 1/3 for p in available_providers},
+        "Précision": best_weights,
+        "Prudent": proposed if preset == "Prudent" else dict(zip(provider_metrics.dropna(subset=["MAPE (%)"]).sort_values("MAPE (%)").Prestataire, [.60, .25, .15])),
+    }
+    for label, point in points.items():
+        simplex.add_trace(go.Scatterternary(
+            a=[point.get(available_providers[0], 0) * 100],
+            b=[point.get(available_providers[1], 0) * 100],
+            c=[point.get(available_providers[2], 0) * 100],
+            mode="markers+text", text=[label], textposition="top center",
+            marker=dict(size=14 if label == "Choix actuel" else 9), name=label))
+    simplex.update_layout(height=360, showlegend=False, ternary=dict(sum=100,
+        aaxis_title=available_providers[0], baxis_title=available_providers[1], caxis_title=available_providers[2]),
+        margin=dict(l=35, r=35, t=20, b=35))
+
+    imbalance_prices = generate_imbalance_prices(spot.loc[forecast_index], int(imbalance_seed), imbalance_spread, imbalance_jumps)
+    balancing_hourly, balancing_summary = calculate_balancing_pnl(actual_forecast, barycentre,
+                                                                   spot.loc[forecast_index], imbalance_prices)
+    kpis = st.columns(6)
+    kpis[0].metric("MAPE barycentre", f"{bary_mape:.2f} %")
+    kpis[1].metric("Poids normalisés", "100 %", "combinaison convexe")
+    kpis[2].metric("Écart court", f"{balancing_summary['short_mwh']:.1f} MWh")
+    kpis[3].metric("Écart long", f"{balancing_summary['long_mwh']:.1f} MWh")
+    kpis[4].metric("P&L balancing", money(balancing_summary["pnl"]), "positif = gain")
+    kpis[5].metric("Coût des écarts", money(balancing_summary["balancing_cost"]))
+
+    chart_cols = st.columns([1, 1])
+    with chart_cols[0]:
+        st.plotly_chart(simplex, width="stretch", key="forecast_barycentric_simplex")
+    with chart_cols[1]:
+        mape_fig = go.Figure(go.Bar(x=provider_view.Prestataire, y=provider_view["MAPE (%)"],
+                                   marker_color=["#10B981", "#10B981", "#F59E0B", "#EF4444"]))
+        mape_fig.add_hline(y=bary_mape, line_dash="dash", line_color="#2563EB", annotation_text="Barycentre")
+        mape_fig.update_layout(height=360, yaxis_title="MAPE (%)", margin=dict(l=20, r=20, t=20, b=35))
+        st.plotly_chart(mape_fig, width="stretch", key="forecast_mape")
+
+    forecast_fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
+        row_heights=[.68, .32], vertical_spacing=.08)
+    forecast_fig.add_trace(go.Scatter(x=actual_forecast.index, y=actual_forecast, name="Réalisé", line=dict(color="#111827", width=2.5)), row=1, col=1, secondary_y=False)
+    for provider in available_providers:
+        forecast_fig.add_trace(go.Scatter(x=provider_forecasts.index, y=provider_forecasts[provider], name=provider, opacity=.42, line=dict(width=1)), row=1, col=1, secondary_y=False)
+        provider_error = actual_forecast - provider_forecasts[provider]
+        forecast_fig.add_trace(go.Scatter(x=provider_error.index, y=provider_error,
+            name=f"Écart {provider}", opacity=.32, line=dict(width=1), showlegend=False), row=2, col=1)
+    forecast_fig.add_trace(go.Scatter(x=barycentre.index, y=barycentre, name="Barycentre", line=dict(color="#2563EB", width=2.5, dash="dash")), row=1, col=1, secondary_y=False)
+    forecast_fig.add_trace(go.Scatter(x=imbalance_prices.index, y=imbalance_prices.up_price, name="Prix écart +", line=dict(color="#EF4444", width=1)), row=1, col=1, secondary_y=True)
+    forecast_fig.add_trace(go.Scatter(x=imbalance_prices.index, y=imbalance_prices.down_price, name="Prix écart −", line=dict(color="#10B981", width=1)), row=1, col=1, secondary_y=True)
+    bary_error = actual_forecast - barycentre
+    forecast_fig.add_trace(go.Bar(x=bary_error.index, y=bary_error, name="Écart barycentre",
+        marker_color=np.where(bary_error >= 0, "#EF4444", "#10B981")), row=2, col=1)
+    forecast_fig.add_hline(y=0, line_color="#64748B", line_width=1, row=2, col=1)
+    forecast_fig.update_yaxes(title_text="Puissance (MW)", row=1, col=1, secondary_y=False)
+    forecast_fig.update_yaxes(title_text="Prix (€/MWh)", row=1, col=1, secondary_y=True, showgrid=False)
+    forecast_fig.update_yaxes(title_text="Réalisé − prévision (MW)", row=2, col=1)
+    forecast_fig.update_layout(height=650, hovermode="x unified", legend=dict(orientation="h", y=1.08), margin=dict(l=20,r=20,t=55,b=20))
+    st.plotly_chart(forecast_fig, width="stretch", key="short_term_forecasts")
+
+    pnl_fig = go.Figure()
+    pnl_fig.add_bar(x=balancing_hourly.index, y=balancing_hourly.balancing_pnl,
+                    marker_color=np.where(balancing_hourly.balancing_pnl >= 0, "#10B981", "#EF4444"), name="P&L horaire")
+    pnl_fig.add_scatter(x=balancing_hourly.index, y=balancing_hourly.balancing_pnl.cumsum(),
+                        name="P&L cumulé", yaxis="y2", line=dict(color="#2563EB", width=2))
+    pnl_fig.update_layout(height=390, hovermode="x unified", yaxis_title="P&L horaire (€)",
+                          yaxis2=dict(title="P&L cumulé (€)", overlaying="y", side="right", showgrid=False),
+                          legend=dict(orientation="h", y=1.1), margin=dict(l=20,r=20,t=40,b=20))
+    st.plotly_chart(pnl_fig, width="stretch", key="balancing_pnl")
+    st.caption("P&L = coût du réalisé valorisé au spot − coût de la nomination et du règlement des écarts. Un P&L négatif est un surcoût.")
+    export_balancing = balancing_hourly.assign(barycentric_forecast=barycentre)
+    st.download_button("Télécharger le suivi horaire CSV", export_balancing.to_csv().encode(),
+                       "previsions_et_balancing.csv", "text/csv")
+
+with tabs[5]:
     st.subheader("Hypothèses, qualité et données")
     note_path = Path(__file__).with_name("CALCULS_ET_HYPOTHESES.md")
     note_text = note_path.read_text(encoding="utf-8")
     with st.expander("📘 Note méthodologique détaillée", expanded=True):
-        st.markdown(note_text)
+        render_markdown_with_math(note_text)
         st.download_button(
             "Télécharger la note méthodologique",
             note_text.encode("utf-8"),
             file_name="EnergyPilot_note_methodologique.md",
             mime="text/markdown",
         )
+    st.markdown("### Shape horaire du prix spot")
+    shape_hours = pd.date_range("2025-01-06", periods=24, freq="h")
+    shape_weekday = generate_spot_prices(shape_hours, peak, offpeak, 0, 1, 0,
+                                         weekday_shape, weekend_shape)
+    weekend_hours = pd.date_range("2025-01-11", periods=24, freq="h")
+    shape_weekend = generate_spot_prices(weekend_hours, peak, offpeak, 0, 1, 0,
+                                         weekday_shape, weekend_shape)
+    shape_fig = go.Figure()
+    shape_fig.add_scatter(x=list(range(24)), y=shape_weekday.to_numpy(), name="Jour ouvré", line=dict(color="#2563EB", width=3))
+    shape_fig.add_scatter(x=list(range(24)), y=shape_weekend.to_numpy(), name="Week-end", line=dict(color="#10B981", width=3))
+    shape_fig.update_layout(height=330, xaxis_title="Heure", yaxis_title="Prix hors volatilité (€/MWh)", xaxis=dict(dtick=2), margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(shape_fig, width="stretch", key="spot_hourly_shapes")
+    st.caption("Exemple avec la saisonnalité du jour sélectionné, sans bruit ni épisode extrême.")
     st.markdown("### Contrôles de qualité")
     expected = len(index)
     issues = []

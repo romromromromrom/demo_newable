@@ -42,13 +42,19 @@ Le curseur **Sévérité de l'hiver** abaisse ou relève la température synthé
 
 Une heure est dite **peak** du lundi au vendredi, de 08 h inclus à 20 h exclu. Les autres heures sont off-peak. Les jours fériés ne sont pas retirés dans cette version.
 
-Le prix avant événements extrêmes suit la forme :
+Deux shapes horaires déterministes sont appliquées par défaut :
 
-$$P_h^{spot}=\mu_h+S_h+\epsilon_h$$
+- **jour ouvré** : creux nocturne, rampe matinale à partir de 06–07 h, plateau en journée, puis pointe du soir vers 18–20 h ;
+- **week-end** : creux nocturne plus prononcé, remontée lente en journée et pointe du soir atténuée.
+
+Ces deux shapes sont intégralement modifiables dans la barre latérale via un tableau de 24 lignes. Chaque cellule est un écart horaire en €/MWh, borné entre `-100` et `+100 €/MWh`, ajouté au niveau de référence correspondant. Une modification recalcule immédiatement la courbe spot et le budget. Elles rendent la courbe continue autour des frontières peak/off-peak, sans supprimer la distinction contractuelle entre ces deux périodes. Le prix avant événements extrêmes suit la forme :
+
+$$P_h^{spot}=\mu_h+H_{d,h}+S_h+\epsilon_h$$
 
 avec :
 
 - $\mu_h=\mu_{peak}$ ou $\mu_{offpeak}$ selon l'heure ;
+- $H_{d,h}$ la shape correspondant à l'heure et au type de jour (ouvré ou week-end) ;
 - $S_h$ une saisonnalité hivernale sinusoïdale ;
 - $\epsilon_h\sim\mathcal{N}(0,\sigma)$, où $\sigma$ est la volatilité choisie.
 
@@ -136,7 +142,7 @@ Le déplacement n'a lieu que si une heure admissible présente un coût marginal
 
 Pour tout bâtiment et usage piloté, l'invariant énergétique est :
 
-$$\sum_h E_{b,u,h}^{optimisé}=\sum_h E_{b,u,h}^{initial}$$
+$$\sum_h E_{b,u,h}^{opt}=\sum_h E_{b,u,h}^{init}$$
 
 Les consommations sont contraintes à rester positives ou nulles. La consommation non flexible n'est jamais modifiée. Cette démonstration ne modélise toutefois ni puissance maximale d'équipement, ni rebond thermique, ni durée minimale de fonctionnement, ni état de charge des véhicules.
 
@@ -150,7 +156,7 @@ Trois résultats sont calculés sur les mêmes consommations et les mêmes prix 
 
 Les économies de pilotage sont mesurées entre les scénarios 2 et 3 :
 
-$$Économies=C_{bloc+spot}^{initial}-C_{bloc+spot}^{optimisé}$$
+$$S=C_{bloc+spot}^{init}-C_{bloc+spot}^{opt}$$
 
 Le pourcentage d'économie utilise le budget bloc + spot initial comme dénominateur. Les scénarios prédéfinis modifient simultanément des hypothèses de couverture, de prix ou de météo ; ils servent de points de départ et restent modifiables.
 
@@ -213,3 +219,25 @@ Les contrôles intégrés signalent également une série temporelle incomplète
 - Les résultats financiers non arrondis font foi dans les calculs ; les cartes et tableaux peuvent présenter de petits écarts visuels dus à l'arrondi.
 
 Ces simplifications rendent les mécanismes transparents et facilement modifiables. Pour un usage opérationnel, il faudrait remplacer les données synthétiques par des courbes de charge validées, intégrer les clauses contractuelles réelles et calibrer les contraintes de flexibilité équipement par équipement.
+
+## 13. Prévisions court terme et balancing
+
+La plateforme simule quatre prévisionnistes externes. Trois livrent une courbe day-ahead ; le quatrième, LoadSense, est volontairement affiché en retard et ne participe pas au barycentre. Les erreurs combinent biais prestataire, erreur horaire corrélée et bruit résiduel. Le classement visible utilise la MAPE :
+
+$$MAPE=\frac{100}{N}\sum_h\left|\frac{E_h-\widehat{E}_h}{E_h}\right|$$
+
+La prévision barycentrique est une combinaison convexe des prévisions disponibles :
+
+$$\widehat{E}_h^{bar}=\sum_p w_p\widehat{E}_{p,h},\qquad w_p\geq0,\qquad\sum_p w_p=1$$
+
+Les points proposés sont l'équipondération, une pondération inversement proportionnelle à la MAPE et une pondération prudente concentrée à 60 % sur le meilleur prestataire. Le simplexe représente visuellement ces choix. Le graphique opérationnel affiche aussi l'écart signé en MW : une valeur positive signifie que le réalisé dépasse la prévision, donc que le portefeuille est court.
+
+Les prix de balancing sont centrés autour du spot : le prix d'activation à la hausse reste supérieur au spot et le prix à la baisse inférieur. Des sauts rares et reproductibles simulent les périodes de tension. Si le réalisé dépasse la prévision, l'écart court est acheté au prix à la hausse. Si la prévision dépasse le réalisé, l'écart long est revendu au prix à la baisse :
+
+$$C_h^{settlement}=\widehat{E}_hP_h^{spot}+\max(E_h-\widehat{E}_h,0)P_h^{up}-\max(\widehat{E}_h-E_h,0)P_h^{down}$$
+
+Le P&L horaire compare ce règlement à une situation théorique où le réalisé aurait été acheté exactement au spot :
+
+$$PnL_h=E_hP_h^{spot}-C_h^{settlement}$$
+
+Un P&L négatif correspond donc à un surcoût d'écart. Ce modèle ne reproduit pas toutes les règles d'un mécanisme d'ajustement réel : il sert à rendre visibles l'effet de la qualité de prévision et l'asymétrie des prix d'écart.

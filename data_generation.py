@@ -26,6 +26,18 @@ BUILDINGS = [
     Building("Prisme", "Marseille", "Bureaux", 14_000, "PAC"),
 ]
 
+# Shapes horaires en €/MWh autour des niveaux peak/off-peak. Elles représentent
+# une courbe de prix française stylisée : creux nocturne, rampe matinale,
+# plateau de journée et pointe du soir. Le week-end est plus bas et plus plat.
+WEEKDAY_HOURLY_SHAPE = np.array([
+    -15, -18, -20, -21, -19, -14, -7, 2, 7, 5, 2, 0,
+    -3, -4, -2, 1, 7, 15, 23, 25, 18, 9, 1, -8,
+], dtype=float)
+WEEKEND_HOURLY_SHAPE = np.array([
+    -17, -20, -22, -23, -22, -19, -15, -11, -7, -4, -2, 0,
+    1, 0, -1, 0, 3, 8, 13, 14, 9, 3, -5, -11,
+], dtype=float)
+
 
 def _temperature(index: pd.DatetimeIndex, cold_factor: float, rng: np.random.Generator) -> np.ndarray:
     day = index.dayofyear.to_numpy()
@@ -74,13 +86,27 @@ def generate_portfolio(year: int = 2025, seed: int = 42, cold_factor: float = 1.
 
 def generate_spot_prices(index: pd.DatetimeIndex, peak_mean: float = 105.0,
                          offpeak_mean: float = 72.0, volatility: float = 18.0,
-                         seed: int = 7, extreme_intensity: float = 1.0) -> pd.Series:
+                         seed: int = 7, extreme_intensity: float = 1.0,
+                         weekday_shape: tuple[float, ...] | np.ndarray | None = None,
+                         weekend_shape: tuple[float, ...] | np.ndarray | None = None) -> pd.Series:
     """Prix spot synthétique en €/MWh. Peak = lun-ven, 08:00-20:00."""
     rng = np.random.default_rng(seed)
-    peak = (index.dayofweek < 5) & (index.hour >= 8) & (index.hour < 20)
+    weekday = index.dayofweek < 5
+    peak = weekday & (index.hour >= 8) & (index.hour < 20)
+    # Les paramètres utilisateur restent les niveaux de référence peak et
+    # off-peak. La shape introduit une continuité et des pointes plausibles.
     base = np.where(peak, peak_mean, offpeak_mean).astype(float)
+    weekday_values = np.asarray(weekday_shape if weekday_shape is not None else WEEKDAY_HOURLY_SHAPE, dtype=float)
+    weekend_values = np.asarray(weekend_shape if weekend_shape is not None else WEEKEND_HOURLY_SHAPE, dtype=float)
+    if weekday_values.shape != (24,) or weekend_values.shape != (24,):
+        raise ValueError("Chaque shape spot doit contenir exactement 24 valeurs horaires.")
+    hourly_shape = np.where(
+        weekday,
+        weekday_values[index.hour],
+        weekend_values[index.hour],
+    )
     winter = 11 * np.cos(2 * np.pi * (index.dayofyear.to_numpy() - 15) / 365)
-    price = base + winter + rng.normal(0, volatility, len(index))
+    price = base + hourly_shape + winter + rng.normal(0, volatility, len(index))
     n_spikes = max(3, int(15 * extreme_intensity))
     spike_ids = rng.choice(len(index), n_spikes, replace=False)
     price[spike_ids] += rng.uniform(100, 320, n_spikes) * extreme_intensity

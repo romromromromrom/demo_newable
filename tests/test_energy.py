@@ -58,3 +58,23 @@ def test_peak_offpeak_parameter_effect():
     high = generate_spot_prices(idx, 160, 100, 0, seed=1, extreme_intensity=0)
     assert high.mean() > low.mean()
     assert calculate_cost(load, high, blocks)[1]["total_cost"] > calculate_cost(load, low, blocks)[1]["total_cost"]
+
+
+def test_default_hourly_shapes_are_plausible():
+    weekday = pd.date_range("2025-01-06", periods=24, freq="h")  # lundi
+    weekend = pd.date_range("2025-01-11", periods=24, freq="h")  # samedi
+    wd = generate_spot_prices(weekday, 105, 72, 0, seed=1, extreme_intensity=0)
+    we = generate_spot_prices(weekend, 105, 72, 0, seed=1, extreme_intensity=0)
+    assert wd.iloc[18] > wd.iloc[3]  # pointe du soir > creux nocturne
+    assert we.iloc[18] > we.iloc[3]
+    assert wd.mean() > we.mean()     # semaine plus chère que week-end
+
+
+def test_custom_hourly_shape_is_applied():
+    idx = pd.date_range("2025-01-06", periods=24, freq="h")
+    flat = tuple([0.0] * 24)
+    shaped = list(flat)
+    shaped[12] = 40.0
+    base = generate_spot_prices(idx, 100, 100, 0, 1, 0, flat, flat)
+    custom = generate_spot_prices(idx, 100, 100, 0, 1, 0, tuple(shaped), flat)
+    assert np.isclose(custom.iloc[12] - base.iloc[12], 40.0)
